@@ -74,6 +74,10 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 			mcp.Description("Maximum replies to fetch per thread. Default 25."),
 			mcp.DefaultNumber(25),
 		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Include images from messages in the response (default: false)"),
+			mcp.DefaultBool(false),
+		),
 	), conversationsHandler.ConversationsHistoryHandler)
 
 	s.AddTool(mcp.NewTool("conversations_replies",
@@ -102,6 +106,10 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		mcp.WithString("limit",
 			mcp.DefaultString("1d"),
 			mcp.Description("Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided."),
+		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Include images from messages in the response (default: false)"),
+			mcp.DefaultBool(false),
 		),
 	), conversationsHandler.ConversationsRepliesHandler)
 

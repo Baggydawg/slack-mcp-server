@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,11 +89,15 @@ type SlackAPI interface {
 
 	// Edge API methods
 	ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error)
+
+	// File download methods
+	GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error
 }
 
 type MCPSlackClient struct {
 	slackClient *slack.Client
 	edgeClient  *edge.Client
+	httpClient  *http.Client
 
 	authResponse *slack.AuthTestResponse
 	authProvider auth.Provider
@@ -166,6 +172,7 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 	return &MCPSlackClient{
 		slackClient:  slackClient,
 		edgeClient:   edgeClient,
+		httpClient:   httpClient,
 		authResponse: authResponse,
 		authProvider: authProvider,
 		isEnterprise: isEnterprise,
@@ -288,6 +295,12 @@ func (c *MCPSlackClient) ClientUserBoot(ctx context.Context) (*edge.ClientUserBo
 	return c.edgeClient.ClientUserBoot(ctx)
 }
 
+func (c *MCPSlackClient) GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error {
+	// Use the slack-go client which has the httpClient with cookie jar configured
+	// The cookie jar ensures cookies are properly sent to files.slack.com
+	return c.slackClient.GetFileContext(ctx, downloadURL, writer)
+}
+
 func (c *MCPSlackClient) IsEnterprise() bool {
 	return c.isEnterprise
 }
@@ -298,6 +311,13 @@ func (c *MCPSlackClient) AuthResponse() *slack.AuthTestResponse {
 
 func (c *MCPSlackClient) IsBotToken() bool {
 	return c.isBotToken
+}
+
+// CanDownloadFiles returns true if file downloads are supported with the current auth method.
+// Browser session tokens (xoxc/xoxd) cannot reliably download files from files.slack.com
+// because they require browser cookies that may not be properly forwarded.
+func (c *MCPSlackClient) CanDownloadFiles() bool {
+	return c.isOAuth
 }
 
 func (c *MCPSlackClient) Raw() struct {
@@ -763,6 +783,12 @@ func (ap *ApiProvider) Slack() SlackAPI {
 func (ap *ApiProvider) IsBotToken() bool {
 	client, ok := ap.client.(*MCPSlackClient)
 	return ok && client != nil && client.IsBotToken()
+}
+
+// CanDownloadFiles returns true if file downloads are supported with the current auth method.
+func (ap *ApiProvider) CanDownloadFiles() bool {
+	client, ok := ap.client.(*MCPSlackClient)
+	return ok && client != nil && client.CanDownloadFiles()
 }
 
 func mapChannel(

@@ -72,6 +72,7 @@ type conversationParams struct {
 	includeThreads      bool
 	maxThreads          int
 	maxRepliesPerThread int
+	includeImages       bool
 }
 
 type searchParams struct {
@@ -257,6 +258,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 		zap.String("oldest", params.oldest),
 		zap.String("latest", params.latest),
 		zap.Bool("include_activity", params.activity),
+		zap.Bool("include_images", params.includeImages),
 	)
 
 	historyParams := slack.GetConversationHistoryParameters{
@@ -292,7 +294,69 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
 	}
-	return marshalMessagesToCSV(messages)
+
+	// Marshal messages to CSV
+	csvBytes, err := gocsv.MarshalBytes(&messages)
+	if err != nil {
+		return nil, err
+	}
+	csvText := string(csvBytes)
+
+	// Handle image extraction if requested
+	if params.includeImages {
+		ch.logger.Info("Image extraction requested, starting...")
+		var allImages []ImageInfo
+
+		// Extract images from messages
+		for _, msg := range history.Messages {
+			images := ExtractImagesFromMessage(msg)
+			allImages = append(allImages, images...)
+
+			// Also extract from attachments
+			attachmentImages := ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp)
+			allImages = append(allImages, attachmentImages...)
+		}
+
+		ch.logger.Info("Image extraction complete", zap.Int("total_images_found", len(allImages)))
+
+		if len(allImages) > 0 {
+			ch.logger.Info("Starting image downloads...")
+			for i, img := range allImages {
+				ch.logger.Info("Image to download",
+					zap.Int("index", i),
+					zap.String("name", img.Name),
+					zap.String("mimeType", img.MimeType),
+					zap.Int("size", img.Size),
+					zap.String("url_length", fmt.Sprintf("%d chars", len(img.URL))),
+				)
+			}
+
+			// Download images with concurrency limit
+			imageData, warnings := DownloadImagesWithConcurrencyLimit(ctx, ch.apiProvider.Slack(), allImages)
+
+			ch.logger.Info("Image downloads complete",
+				zap.Int("successful_downloads", len(imageData)),
+				zap.Int("warnings", len(warnings)),
+			)
+
+			for key, data := range imageData {
+				ch.logger.Info("Downloaded image",
+					zap.String("key", key),
+					zap.Int("data_size_bytes", len(data)),
+				)
+			}
+
+			// Convert to MCP content
+			imageContent := ImagesToMCPContent(allImages, imageData)
+			ch.logger.Info("Converted to MCP content", zap.Int("content_items", len(imageContent)))
+
+			result := buildResultWithImages(csvText, imageContent, warnings)
+			ch.logger.Info("Built result with images, returning...")
+			return result, nil
+		}
+	}
+
+	return mcp.NewToolResultText(csvText), nil
 }
 
 // ConversationsRepliesHandler streams thread replies as CSV
@@ -330,7 +394,42 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 	if len(messages) > 0 && hasMore {
 		messages[len(messages)-1].Cursor = nextCursor
 	}
-	return marshalMessagesToCSV(messages)
+
+	// Marshal messages to CSV
+	csvBytes, err := gocsv.MarshalBytes(&messages)
+	if err != nil {
+		return nil, err
+	}
+	csvText := string(csvBytes)
+
+	// Handle image extraction if requested
+	if params.includeImages {
+		var allImages []ImageInfo
+
+		// Extract images from replies
+		for _, msg := range replies {
+			images := ExtractImagesFromMessage(msg)
+			allImages = append(allImages, images...)
+
+			// Also extract from attachments
+			attachmentImages := ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp)
+			allImages = append(allImages, attachmentImages...)
+		}
+
+		if len(allImages) > 0 {
+			ch.logger.Debug("Found images in replies", zap.Int("image_count", len(allImages)))
+
+			// Download images with concurrency limit
+			imageData, warnings := DownloadImagesWithConcurrencyLimit(ctx, ch.apiProvider.Slack(), allImages)
+
+			// Convert to MCP content
+			imageContent := ImagesToMCPContent(allImages, imageData)
+
+			return buildResultWithImages(csvText, imageContent, warnings), nil
+		}
+	}
+
+	return mcp.NewToolResultText(csvText), nil
 }
 
 func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -676,6 +775,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	includeThreads := request.GetBool("include_threads", false)
 	maxThreads := request.GetInt("max_threads", 5)
 	maxRepliesPerThread := request.GetInt("max_replies_per_thread", 25)
+	includeImages := request.GetBool("include_images", false)
 
 	// Cap maxThreads at 20
 	if maxThreads > 20 {
@@ -788,6 +888,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 		includeThreads:      includeThreads,
 		maxThreads:          maxThreads,
 		maxRepliesPerThread: maxRepliesPerThread,
+		includeImages:       includeImages,
 	}, nil
 }
 
@@ -1298,4 +1399,33 @@ func buildQuery(freeText []string, filters map[string][]string) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// buildResultWithImages creates a CallToolResult containing CSV text and optional images
+// If no images, returns simple text result. If images exist, builds multi-content result.
+func buildResultWithImages(csvText string, imageContent []mcp.Content, warnings []string) *mcp.CallToolResult {
+	// Prepend warnings to CSV text if any
+	finalText := csvText
+	if len(warnings) > 0 {
+		warningText := "# Image download warnings:\n"
+		for _, w := range warnings {
+			warningText += "# " + w + "\n"
+		}
+		warningText += "\n"
+		finalText = warningText + csvText
+	}
+
+	// If no images, return simple text result
+	if len(imageContent) == 0 {
+		return mcp.NewToolResultText(finalText)
+	}
+
+	// Build multi-content result with text first, then images
+	content := make([]mcp.Content, 0, 1+len(imageContent))
+	content = append(content, mcp.NewTextContent(finalText))
+	content = append(content, imageContent...)
+
+	return &mcp.CallToolResult{
+		Content: content,
+	}
 }

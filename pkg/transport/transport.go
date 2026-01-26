@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/publicsuffix"
 )
 
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -442,8 +444,25 @@ func ProvideHTTPClient(cookies []*http.Cookie, logger *zap.Logger) *http.Client 
 
 	transport = NewUserAgentTransport(transport, userAgent, cookies, logger)
 
+	// Create a cookie jar for proper cookie domain handling
+	// This is CRITICAL for file downloads with browser tokens (xoxc/xoxd)
+	// The cookie jar ensures cookies with domain ".slack.com" are sent to "files.slack.com"
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		logger.Error("Failed to create cookie jar, file downloads may not work", zap.Error(err))
+	}
+
+	// Set cookies on the slack.com domain so they're sent to all subdomains
+	if jar != nil && len(cookies) > 0 {
+		slackURL, _ := url.Parse("https://slack.com")
+		jar.SetCookies(slackURL, cookies)
+		logger.Debug("Cookie jar initialized with cookies for slack.com domain",
+			zap.Int("cookie_count", len(cookies)))
+	}
+
 	client := &http.Client{
 		Transport: transport,
+		Jar:       jar,
 		Timeout:   30 * time.Second,
 	}
 
