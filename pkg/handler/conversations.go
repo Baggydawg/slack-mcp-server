@@ -39,16 +39,20 @@ var validFilterKeys = map[string]struct{}{
 }
 
 type Message struct {
-	MsgID     string `json:"msgID"`
-	UserID    string `json:"userID"`
-	UserName  string `json:"userUser"`
-	RealName  string `json:"realName"`
-	Channel   string `json:"channelID"`
-	ThreadTs  string `json:"ThreadTs"`
-	Text      string `json:"text"`
-	Time      string `json:"time"`
-	Reactions string `json:"reactions,omitempty"`
-	Cursor    string `json:"cursor"`
+	MsgID            string `json:"msgID"`
+	UserID           string `json:"userID"`
+	UserName         string `json:"userUser"`
+	RealName         string `json:"realName"`
+	Channel          string `json:"channelID"`
+	ThreadTs         string `json:"ThreadTs"`
+	Text             string `json:"text"`
+	Time             string `json:"time"`
+	Reactions        string `json:"reactions,omitempty"`
+	Cursor           string `json:"cursor"`
+	ParentMsgId      string `json:"parentMsgId,omitempty"`
+	IsThreadReply    bool   `json:"isThreadReply,omitempty"`
+	ThreadReplyCount int    `json:"threadReplyCount,omitempty"`
+	ThreadTruncated  bool   `json:"threadTruncated,omitempty"`
 }
 
 type User struct {
@@ -58,18 +62,26 @@ type User struct {
 }
 
 type conversationParams struct {
-	channel  string
-	limit    int
-	oldest   string
-	latest   string
-	cursor   string
-	activity bool
+	channel             string
+	limit               int
+	oldest              string
+	latest              string
+	cursor              string
+	activity            bool
+	excludeBots         bool
+	includeThreads      bool
+	maxThreads          int
+	maxRepliesPerThread int
 }
 
 type searchParams struct {
-	query string
-	limit int
-	page  int
+	query               string
+	limit               int
+	page                int
+	excludeBots         bool
+	includeThreads      bool
+	maxThreads          int
+	maxRepliesPerThread int
 }
 
 type addMessageParams struct {
@@ -226,7 +238,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 	}
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false)
+	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false, false)
 	return marshalMessagesToCSV(messages)
 }
 
@@ -263,7 +275,19 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity, params.excludeBots)
+
+	// Expand threads if requested
+	if params.includeThreads && len(messages) > 0 {
+		var threadErrors []string
+		messages, threadErrors = ch.expandThreads(ctx, messages, params.channel, params.excludeBots, params.maxThreads, params.maxRepliesPerThread)
+		if len(threadErrors) > 0 {
+			ch.logger.Warn("Some threads failed to expand",
+				zap.Int("error_count", len(threadErrors)),
+				zap.Strings("errors", threadErrors),
+			)
+		}
+	}
 
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
@@ -302,7 +326,7 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 	}
 	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
 
-	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity, params.excludeBots)
 	if len(messages) > 0 && hasMore {
 		messages[len(messages)-1].Cursor = nextCursor
 	}
@@ -333,7 +357,49 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	}
 	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
 
-	messages := ch.convertMessagesFromSearch(messagesRes.Matches)
+	messages := ch.convertMessagesFromSearch(messagesRes.Matches, params.excludeBots)
+
+	// Expand threads if requested
+	if params.includeThreads && len(messages) > 0 {
+		// Search results contain messages from different channels, so we need to group them
+		var threadErrors []string
+		for i, msg := range messages {
+			hasThread := msg.ThreadTs != "" && msg.ThreadTs == msg.MsgID
+			if hasThread && i < params.maxThreads {
+				repliesParams := slack.GetConversationRepliesParameters{
+					ChannelID: msg.Channel,
+					Timestamp: msg.MsgID,
+					Limit:     params.maxRepliesPerThread,
+				}
+
+				repliesResp, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
+				if err != nil {
+					threadErrors = append(threadErrors, fmt.Sprintf("thread %s: %v", msg.MsgID, err))
+					continue
+				}
+
+				// Add thread replies after the parent
+				for j, reply := range repliesResp {
+					if j == 0 && reply.Timestamp == msg.MsgID {
+						continue
+					}
+					replyMsg := ch.convertSingleMessage(reply, msg.Channel, false, params.excludeBots)
+					if replyMsg != nil {
+						replyMsg.ParentMsgId = msg.MsgID
+						replyMsg.IsThreadReply = true
+						messages = append(messages, *replyMsg)
+					}
+				}
+			}
+		}
+		if len(threadErrors) > 0 {
+			ch.logger.Warn("Some threads failed to expand in search",
+				zap.Int("error_count", len(threadErrors)),
+				zap.Strings("errors", threadErrors),
+			)
+		}
+	}
+
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
 		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
@@ -363,7 +429,109 @@ func isChannelAllowed(channel string) bool {
 	return !isNegated
 }
 
-func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool) []Message {
+// expandThreads fetches thread replies for messages that have threads
+func (ch *ConversationsHandler) expandThreads(ctx context.Context, messages []Message, channelID string, excludeBots bool, maxThreads int, maxRepliesPerThread int) ([]Message, []string) {
+	var result []Message
+	var errors []string
+	threadCount := 0
+
+	for _, msg := range messages {
+		result = append(result, msg)
+
+		// Check if message has replies and we haven't hit thread limit
+		hasThread := msg.ThreadTs != "" && msg.ThreadTs == msg.MsgID // Parent message
+		if hasThread && threadCount < maxThreads {
+			// Fetch thread replies
+			repliesParams := slack.GetConversationRepliesParameters{
+				ChannelID: channelID,
+				Timestamp: msg.MsgID,
+				Limit:     maxRepliesPerThread,
+			}
+
+			repliesResp, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("thread %s: %v", msg.MsgID, err))
+				continue // Skip failed thread, don't fail entire request
+			}
+
+			// Skip first reply if it's the parent (API includes parent in response)
+			for i, reply := range repliesResp {
+				if i == 0 && reply.Timestamp == msg.MsgID {
+					continue
+				}
+
+				// Convert reply to Message
+				replyMsg := ch.convertSingleMessage(reply, channelID, false, excludeBots)
+				if replyMsg != nil {
+					replyMsg.ParentMsgId = msg.MsgID
+					replyMsg.IsThreadReply = true
+					result = append(result, *replyMsg)
+				}
+			}
+
+			threadCount++
+		}
+	}
+
+	return result, errors
+}
+
+// convertSingleMessage converts a single slack.Message to Message struct
+func (ch *ConversationsHandler) convertSingleMessage(msg slack.Message, channel string, includeActivity bool, excludeBots bool) *Message {
+	usersMap := ch.apiProvider.ProvideUsersMap()
+
+	if (msg.SubType != "" && msg.SubType != "bot_message") && !includeActivity {
+		return nil
+	}
+
+	// Filter out bot messages if requested
+	if excludeBots {
+		if msg.SubType == "bot_message" {
+			return nil
+		}
+		if user, ok := usersMap.Users[msg.User]; ok && user.IsBot {
+			return nil
+		}
+	}
+
+	userName, realName, ok := getUserInfo(msg.User, usersMap.Users)
+	if !ok && msg.SubType == "bot_message" {
+		userName, realName, ok = getBotInfo(msg.Username)
+	}
+	if !ok {
+		userName = "unknown"
+		realName = "unknown"
+	}
+
+	timestamp, err := text.TimestampToIsoRFC3339(msg.Timestamp)
+	if err != nil {
+		ch.logger.Error("Failed to convert timestamp to RFC3339", zap.Error(err))
+		return nil
+	}
+
+	msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
+
+	var reactionParts []string
+	for _, r := range msg.Reactions {
+		reactionParts = append(reactionParts, fmt.Sprintf("%s:%d", r.Name, r.Count))
+	}
+	reactionsString := strings.Join(reactionParts, "|")
+
+	return &Message{
+		MsgID:            msg.Timestamp,
+		UserID:           msg.User,
+		UserName:         userName,
+		RealName:         realName,
+		Channel:          channel,
+		ThreadTs:         msg.ThreadTimestamp,
+		Text:             text.ProcessText(msgText),
+		Time:             timestamp,
+		Reactions:        reactionsString,
+		ThreadReplyCount: msg.ReplyCount,
+	}
+}
+
+func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool, excludeBots bool) []Message {
 	usersMap := ch.apiProvider.ProvideUsersMap()
 	var messages []Message
 	warn := false
@@ -371,6 +539,16 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 	for _, msg := range slackMessages {
 		if (msg.SubType != "" && msg.SubType != "bot_message") && !includeActivity {
 			continue
+		}
+
+		// Filter out bot messages if requested
+		if excludeBots {
+			if msg.SubType == "bot_message" {
+				continue
+			}
+			if user, ok := usersMap.Users[msg.User]; ok && user.IsBot {
+				continue
+			}
 		}
 
 		userName, realName, ok := getUserInfo(msg.User, usersMap.Users)
@@ -398,15 +576,16 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 		reactionsString := strings.Join(reactionParts, "|")
 
 		messages = append(messages, Message{
-			MsgID:     msg.Timestamp,
-			UserID:    msg.User,
-			UserName:  userName,
-			RealName:  realName,
-			Text:      text.ProcessText(msgText),
-			Channel:   channel,
-			ThreadTs:  msg.ThreadTimestamp,
-			Time:      timestamp,
-			Reactions: reactionsString,
+			MsgID:            msg.Timestamp,
+			UserID:           msg.User,
+			UserName:         userName,
+			RealName:         realName,
+			Text:             text.ProcessText(msgText),
+			Channel:          channel,
+			ThreadTs:         msg.ThreadTimestamp,
+			Time:             timestamp,
+			Reactions:        reactionsString,
+			ThreadReplyCount: msg.ReplyCount,
 		})
 	}
 
@@ -421,12 +600,24 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 	return messages
 }
 
-func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage) []Message {
+func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage, excludeBots bool) []Message {
 	usersMap := ch.apiProvider.ProvideUsersMap()
 	var messages []Message
 	warn := false
 
 	for _, msg := range slackMessages {
+		// Filter out bot messages if requested
+		if excludeBots {
+			// Check if it's a bot by username (bot messages often have empty User field)
+			if msg.User == "" && msg.Username != "" {
+				continue
+			}
+			// Check if the user is a bot
+			if user, ok := usersMap.Users[msg.User]; ok && user.IsBot {
+				continue
+			}
+		}
+
 		userName, realName, ok := getUserInfo(msg.User, usersMap.Users)
 
 		if !ok && msg.User == "" && msg.Username != "" {
@@ -478,7 +669,18 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 
 	limit := request.GetString("limit", "")
 	cursor := request.GetString("cursor", "")
+	before := request.GetString("before", "")
+	after := request.GetString("after", "")
 	activity := request.GetBool("include_activity_messages", false)
+	excludeBots := request.GetBool("exclude_bots", true)
+	includeThreads := request.GetBool("include_threads", false)
+	maxThreads := request.GetInt("max_threads", 5)
+	maxRepliesPerThread := request.GetInt("max_replies_per_thread", 25)
+
+	// Cap maxThreads at 20
+	if maxThreads > 20 {
+		maxThreads = 20
+	}
 
 	var (
 		paramLimit  int
@@ -486,17 +688,67 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 		paramLatest string
 		err         error
 	)
-	if strings.HasSuffix(limit, "d") || strings.HasSuffix(limit, "w") || strings.HasSuffix(limit, "m") {
+
+	// Check if explicit before/after date range is provided
+	hasExplicitDateRange := before != "" || after != ""
+
+	if hasExplicitDateRange {
+		// Parse explicit date range parameters
+		if after != "" {
+			afterTime, err := parseISO8601OrFlexible(after)
+			if err != nil {
+				ch.logger.Error("Invalid 'after' date", zap.String("after", after), zap.Error(err))
+				return nil, fmt.Errorf("invalid 'after' date: %v", err)
+			}
+			paramOldest = fmt.Sprintf("%d.000000", afterTime.Unix())
+		}
+		if before != "" {
+			beforeTime, err := parseISO8601OrFlexible(before)
+			if err != nil {
+				ch.logger.Error("Invalid 'before' date", zap.String("before", before), zap.Error(err))
+				return nil, fmt.Errorf("invalid 'before' date: %v", err)
+			}
+			paramLatest = fmt.Sprintf("%d.000000", beforeTime.Unix())
+		}
+
+		// When date range is specified, limit controls max messages within that range
+		if limit != "" {
+			if strings.HasSuffix(limit, "d") || strings.HasSuffix(limit, "w") || strings.HasSuffix(limit, "m") {
+				// Duration limit doesn't make sense with explicit dates, treat as numeric
+				ch.logger.Warn("Duration limit ignored when before/after specified, using default message count")
+				paramLimit = 100
+			} else {
+				paramLimit, err = limitByNumeric(limit, 100)
+				if err != nil {
+					ch.logger.Error("Invalid numeric limit", zap.String("limit", limit), zap.Error(err))
+					return nil, err
+				}
+			}
+		} else {
+			// Default to 100 messages when date range is specified without limit
+			paramLimit = 100
+		}
+	} else if strings.HasSuffix(limit, "d") || strings.HasSuffix(limit, "w") || strings.HasSuffix(limit, "m") {
 		paramLimit, paramOldest, paramLatest, err = limitByExpression(limit, defaultConversationsExpressionLimit)
 		if err != nil {
 			ch.logger.Error("Invalid duration limit", zap.String("limit", limit), zap.Error(err))
 			return nil, err
 		}
 	} else if cursor == "" {
-		paramLimit, err = limitByNumeric(limit, defaultConversationsNumericLimit)
-		if err != nil {
-			ch.logger.Error("Invalid numeric limit", zap.String("limit", limit), zap.Error(err))
-			return nil, err
+		// No date range and no duration limit - use numeric limit or default to 1d
+		if limit == "" {
+			// Default behavior: last 1 day of messages
+			paramLimit, paramOldest, paramLatest, err = limitByExpression("1d", defaultConversationsExpressionLimit)
+			if err != nil {
+				ch.logger.Error("Invalid default duration limit", zap.Error(err))
+				return nil, err
+			}
+		} else {
+			paramLimit, err = limitByNumeric(limit, defaultConversationsNumericLimit)
+			if err != nil {
+				ch.logger.Error("Invalid numeric limit", zap.String("limit", limit), zap.Error(err))
+				return nil, err
+			}
 		}
 	}
 
@@ -526,12 +778,16 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	}
 
 	return &conversationParams{
-		channel:  channel,
-		limit:    paramLimit,
-		oldest:   paramOldest,
-		latest:   paramLatest,
-		cursor:   cursor,
-		activity: activity,
+		channel:             channel,
+		limit:               paramLimit,
+		oldest:              paramOldest,
+		latest:              paramLatest,
+		cursor:              cursor,
+		activity:            activity,
+		excludeBots:         excludeBots,
+		includeThreads:      includeThreads,
+		maxThreads:          maxThreads,
+		maxRepliesPerThread: maxRepliesPerThread,
 	}, nil
 }
 
@@ -648,6 +904,15 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	finalQuery := buildQuery(freeText, filters)
 	limit := req.GetInt("limit", 100)
 	cursor := req.GetString("cursor", "")
+	excludeBots := req.GetBool("exclude_bots", true)
+	includeThreads := req.GetBool("include_threads", false)
+	maxThreads := req.GetInt("max_threads", 5)
+	maxRepliesPerThread := req.GetInt("max_replies_per_thread", 25)
+
+	// Cap maxThreads at 20
+	if maxThreads > 20 {
+		maxThreads = 20
+	}
 
 	var (
 		page          int
@@ -677,11 +942,17 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		zap.String("query", finalQuery),
 		zap.Int("limit", limit),
 		zap.Int("page", page),
+		zap.Bool("exclude_bots", excludeBots),
+		zap.Bool("include_threads", includeThreads),
 	)
 	return &searchParams{
-		query: finalQuery,
-		limit: limit,
-		page:  page,
+		query:               finalQuery,
+		limit:               limit,
+		page:                page,
+		excludeBots:         excludeBots,
+		includeThreads:      includeThreads,
+		maxThreads:          maxThreads,
+		maxRepliesPerThread: maxRepliesPerThread,
 	}, nil
 }
 
@@ -796,6 +1067,32 @@ func extractThreadTS(rawurl string) (string, error) {
 		return "", err
 	}
 	return u.Query().Get("thread_ts"), nil
+}
+
+// parseISO8601OrFlexible parses ISO-8601 datetime strings (with time) or flexible date formats
+func parseISO8601OrFlexible(dateStr string) (time.Time, error) {
+	dateStr = strings.TrimSpace(dateStr)
+
+	// Try ISO-8601 formats with time first
+	iso8601Formats := []string{
+		time.RFC3339,           // 2006-01-02T15:04:05Z07:00
+		time.RFC3339Nano,       // 2006-01-02T15:04:05.999999999Z07:00
+		"2006-01-02T15:04:05Z", // 2006-01-02T15:04:05Z (UTC)
+		"2006-01-02T15:04:05",  // 2006-01-02T15:04:05 (no timezone, assume UTC)
+		"2006-01-02 15:04:05",  // 2006-01-02 15:04:05
+	}
+	for _, fmtStr := range iso8601Formats {
+		if t, err := time.Parse(fmtStr, dateStr); err == nil {
+			return t, nil
+		}
+	}
+
+	// Fall back to flexible date parsing (date only, no time)
+	t, _, err := parseFlexibleDate(dateStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("unable to parse datetime: %s", dateStr)
+	}
+	return t, nil
 }
 
 func parseFlexibleDate(dateStr string) (time.Time, string, error) {

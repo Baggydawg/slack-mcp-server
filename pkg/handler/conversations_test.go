@@ -571,6 +571,141 @@ func TestUnitLimitByExpression_Valid(t *testing.T) {
 	}
 }
 
+func TestUnitParseISO8601OrFlexible(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantYear  int
+		wantMonth time.Month
+		wantDay   int
+		wantHour  int
+		wantMin   int
+		wantSec   int
+		wantErr   bool
+	}{
+		// ISO-8601 formats with time
+		{
+			name:      "RFC3339 UTC",
+			input:     "2026-01-23T14:30:00Z",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  14,
+			wantMin:   30,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		{
+			name:      "RFC3339 with timezone offset",
+			input:     "2026-01-23T14:30:00+01:00",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  14,
+			wantMin:   30,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		{
+			name:      "ISO-8601 no timezone",
+			input:     "2026-01-23T14:30:00",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  14,
+			wantMin:   30,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		{
+			name:      "ISO-8601 with space separator",
+			input:     "2026-01-23 14:30:00",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  14,
+			wantMin:   30,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		// Falls back to flexible date parsing (date only)
+		{
+			name:      "Date only YYYY-MM-DD",
+			input:     "2026-01-23",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  0,
+			wantMin:   0,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		{
+			name:      "Flexible date - yesterday",
+			input:     "yesterday",
+			wantYear:  time.Now().UTC().AddDate(0, 0, -1).Year(),
+			wantMonth: time.Now().UTC().AddDate(0, 0, -1).Month(),
+			wantDay:   time.Now().UTC().AddDate(0, 0, -1).Day(),
+			wantHour:  0,
+			wantMin:   0,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		{
+			name:      "Flexible date - January 23, 2026",
+			input:     "January 23, 2026",
+			wantYear:  2026,
+			wantMonth: time.January,
+			wantDay:   23,
+			wantHour:  0,
+			wantMin:   0,
+			wantSec:   0,
+			wantErr:   false,
+		},
+		// Error cases
+		{
+			name:    "Invalid format",
+			input:   "not-a-date",
+			wantErr: true,
+		},
+		{
+			name:    "Empty string",
+			input:   "",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseISO8601OrFlexible(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseISO8601OrFlexible() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				if got.Year() != tt.wantYear {
+					t.Errorf("parseISO8601OrFlexible() year = %v, want %v", got.Year(), tt.wantYear)
+				}
+				if got.Month() != tt.wantMonth {
+					t.Errorf("parseISO8601OrFlexible() month = %v, want %v", got.Month(), tt.wantMonth)
+				}
+				if got.Day() != tt.wantDay {
+					t.Errorf("parseISO8601OrFlexible() day = %v, want %v", got.Day(), tt.wantDay)
+				}
+				if got.Hour() != tt.wantHour {
+					t.Errorf("parseISO8601OrFlexible() hour = %v, want %v", got.Hour(), tt.wantHour)
+				}
+				if got.Minute() != tt.wantMin {
+					t.Errorf("parseISO8601OrFlexible() minute = %v, want %v", got.Minute(), tt.wantMin)
+				}
+				if got.Second() != tt.wantSec {
+					t.Errorf("parseISO8601OrFlexible() second = %v, want %v", got.Second(), tt.wantSec)
+				}
+			}
+		})
+	}
+}
+
 func TestUnitLimitByExpression_Invalid(t *testing.T) {
 	invalid := []string{
 		"d",   // too short
