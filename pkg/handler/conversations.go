@@ -54,6 +54,7 @@ type Message struct {
 	ThreadReplyCount int    `json:"threadReplyCount,omitempty"`
 	ThreadTruncated  bool   `json:"threadTruncated,omitempty"`
 	ImageCount       int    `json:"imageCount,omitempty"`
+	ImageRefs        string `json:"imageRefs,omitempty"`
 }
 
 type User struct {
@@ -332,11 +333,13 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 				)
 			}
 
-			// Download images with concurrency limit
-			imageData, warnings := DownloadImagesWithConcurrencyLimit(ctx, ch.apiProvider.Slack(), allImages)
+			// Download images with budget limit (includes compression)
+			imageData, mimeTypeOverrides, skippedImages, warnings := DownloadImagesWithBudget(ctx, ch.apiProvider.Slack(), allImages, MaxInlineImageBudget)
 
 			ch.logger.Info("Image downloads complete",
 				zap.Int("successful_downloads", len(imageData)),
+				zap.Int("compressed_images", len(mimeTypeOverrides)),
+				zap.Int("skipped_images", len(skippedImages)),
 				zap.Int("warnings", len(warnings)),
 			)
 
@@ -348,10 +351,10 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 			}
 
 			// Convert to MCP content
-			imageContent := ImagesToMCPContent(allImages, imageData)
+			imageContent := ImagesToMCPContent(allImages, imageData, mimeTypeOverrides)
 			ch.logger.Info("Converted to MCP content", zap.Int("content_items", len(imageContent)))
 
-			result := buildResultWithImages(csvText, imageContent, warnings)
+			result := buildResultWithImages(csvText, imageContent, skippedImages, warnings)
 			ch.logger.Info("Built result with images, returning...")
 			return result, nil
 		}
@@ -420,13 +423,13 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		if len(allImages) > 0 {
 			ch.logger.Debug("Found images in replies", zap.Int("image_count", len(allImages)))
 
-			// Download images with concurrency limit
-			imageData, warnings := DownloadImagesWithConcurrencyLimit(ctx, ch.apiProvider.Slack(), allImages)
+			// Download images with budget limit (includes compression)
+			imageData, mimeTypeOverrides, skippedImages, warnings := DownloadImagesWithBudget(ctx, ch.apiProvider.Slack(), allImages, MaxInlineImageBudget)
 
 			// Convert to MCP content
-			imageContent := ImagesToMCPContent(allImages, imageData)
+			imageContent := ImagesToMCPContent(allImages, imageData, mimeTypeOverrides)
 
-			return buildResultWithImages(csvText, imageContent, warnings), nil
+			return buildResultWithImages(csvText, imageContent, skippedImages, warnings), nil
 		}
 	}
 
@@ -617,8 +620,11 @@ func (ch *ConversationsHandler) convertSingleMessage(msg slack.Message, channel 
 	}
 	reactionsString := strings.Join(reactionParts, "|")
 
-	// Count images in this message
-	imageCount := len(ExtractImagesFromMessage(msg)) + len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+	// Extract images from this message
+	fileImages := ExtractImagesFromMessage(msg)
+	attachmentImages := ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp)
+	allImages := append(fileImages, attachmentImages...)
+	imageCount := len(allImages)
 
 	return &Message{
 		MsgID:            msg.Timestamp,
@@ -632,6 +638,7 @@ func (ch *ConversationsHandler) convertSingleMessage(msg slack.Message, channel 
 		Reactions:        reactionsString,
 		ThreadReplyCount: msg.ReplyCount,
 		ImageCount:       imageCount,
+		ImageRefs:        formatImageRefs(allImages),
 	}
 }
 
@@ -679,8 +686,11 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 		}
 		reactionsString := strings.Join(reactionParts, "|")
 
-		// Count images in this message
-		imageCount := len(ExtractImagesFromMessage(msg)) + len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+		// Extract images from this message
+		fileImages := ExtractImagesFromMessage(msg)
+		attachmentImages := ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp)
+		allImages := append(fileImages, attachmentImages...)
+		imageCount := len(allImages)
 
 		messages = append(messages, Message{
 			MsgID:            msg.Timestamp,
@@ -694,6 +704,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 			Reactions:        reactionsString,
 			ThreadReplyCount: msg.ReplyCount,
 			ImageCount:       imageCount,
+			ImageRefs:        formatImageRefs(allImages),
 		})
 	}
 
@@ -744,8 +755,9 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 
 		msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
 
-		// Count images from attachments (SearchMessage may not include Files)
-		imageCount := len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+		// Extract images from attachments (SearchMessage may not include Files)
+		attachmentImages := ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp)
+		imageCount := len(attachmentImages)
 
 		messages = append(messages, Message{
 			MsgID:      msg.Timestamp,
@@ -758,6 +770,7 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 			Time:       timestamp,
 			Reactions:  "",
 			ImageCount: imageCount,
+			ImageRefs:  formatImageRefs(attachmentImages),
 		})
 	}
 
@@ -1183,6 +1196,24 @@ func extractThreadTS(rawurl string) (string, error) {
 	return u.Query().Get("thread_ts"), nil
 }
 
+// formatImageRefs formats a slice of ImageInfo into a pipe-delimited string
+// Format: fileId:filename:sizeBytes|fileId:filename:sizeBytes
+// For attachments without FileID, the URL is used as the identifier
+func formatImageRefs(images []ImageInfo) string {
+	if len(images) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, img := range images {
+		id := img.FileID
+		if id == "" {
+			id = img.URL
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s:%d", id, img.Name, img.Size))
+	}
+	return strings.Join(parts, "|")
+}
+
 // parseISO8601OrFlexible parses ISO-8601 datetime strings (with time) or flexible date formats
 func parseISO8601OrFlexible(dateStr string) (time.Time, error) {
 	dateStr = strings.TrimSpace(dateStr)
@@ -1416,17 +1447,38 @@ func buildQuery(freeText []string, filters map[string][]string) string {
 
 // buildResultWithImages creates a CallToolResult containing CSV text and optional images
 // If no images, returns simple text result. If images exist, builds multi-content result.
-func buildResultWithImages(csvText string, imageContent []mcp.Content, warnings []string) *mcp.CallToolResult {
+func buildResultWithImages(csvText string, imageContent []mcp.Content, skippedImages []ImageInfo, warnings []string) *mcp.CallToolResult {
 	// Prepend warnings to CSV text if any
 	finalText := csvText
+	warningText := ""
+
 	if len(warnings) > 0 {
-		warningText := "# Image download warnings:\n"
+		warningText = "# Image download warnings:\n"
 		for _, w := range warnings {
 			warningText += "# " + w + "\n"
 		}
 		warningText += "\n"
-		finalText = warningText + csvText
 	}
+
+	// Add skipped images warning with file IDs for get_image tool
+	if len(skippedImages) > 0 {
+		var fileIDs []string
+		for _, img := range skippedImages {
+			if img.FileID != "" {
+				fileIDs = append(fileIDs, img.FileID)
+			}
+		}
+
+		skippedWarning := fmt.Sprintf("# ACTION REQUIRED: %d image(s) NOT included in this response (separate from any inline images below).\n", len(skippedImages))
+		skippedWarning += "# These images may contain critical context. Before responding, call get_image for EACH of these file IDs:\n"
+		for _, fid := range fileIDs {
+			skippedWarning += fmt.Sprintf("#   - %s\n", fid)
+		}
+		skippedWarning += "\n"
+		warningText += skippedWarning
+	}
+
+	finalText = warningText + csvText
 
 	// If no images, return simple text result
 	if len(imageContent) == 0 {

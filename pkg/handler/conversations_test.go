@@ -725,3 +725,62 @@ func TestUnitLimitByExpression_Invalid(t *testing.T) {
 		})
 	}
 }
+
+func TestUnitFormatImageRefs(t *testing.T) {
+	tests := []struct {
+		name     string
+		images   []ImageInfo
+		expected string
+	}{
+		{
+			name:     "empty images list",
+			images:   []ImageInfo{},
+			expected: "",
+		},
+		{
+			name: "single image with FileID",
+			images: []ImageInfo{
+				{FileID: "F123", Name: "filename.png", Size: 1000},
+			},
+			expected: "F123:filename.png:1000",
+		},
+		{
+			name: "multiple images",
+			images: []ImageInfo{
+				{FileID: "F001", Name: "first.png", Size: 500},
+				{FileID: "F002", Name: "second.jpg", Size: 1500},
+				{FileID: "F003", Name: "third.gif", Size: 2000},
+			},
+			expected: "F001:first.png:500|F002:second.jpg:1500|F003:third.gif:2000",
+		},
+		{
+			name: "image without FileID uses URL as identifier",
+			images: []ImageInfo{
+				{FileID: "", Name: "attachment.png", Size: 750, URL: "https://files.slack.com/attachment/image.png"},
+			},
+			expected: "https://files.slack.com/attachment/image.png:attachment.png:750",
+		},
+		{
+			name: "mixed images with and without FileID",
+			images: []ImageInfo{
+				{FileID: "F100", Name: "file.png", Size: 100},
+				{FileID: "", Name: "attach.jpg", Size: 200, URL: "https://files.slack.com/att.jpg"},
+			},
+			expected: "F100:file.png:100|https://files.slack.com/att.jpg:attach.jpg:200",
+		},
+		{
+			name:     "nil images treated as empty",
+			images:   nil,
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatImageRefs(tt.images)
+			if got != tt.expected {
+				t.Errorf("formatImageRefs() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}

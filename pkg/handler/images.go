@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net/url"
 	"strings"
@@ -17,10 +19,18 @@ import (
 
 // Image processing constants
 const (
-	MaxImageSize           = 5 * 1024 * 1024  // 5MB - Claude API limit
+	MaxImageSize           = 3932160          // 3.75MB - stays under 5MB after base64 encoding
 	MaxImagesPerCall       = 10               // Maximum images per tool call
 	ImageDownloadTimeout   = 30 * time.Second // Timeout for downloading images
 	MaxConcurrentDownloads = 3                // Concurrent download limit
+	MaxInlineImageBudget   = 750 * 1024       // 750KB raw (~1MB base64) - Claude Desktop has response size limit
+)
+
+// Compression settings
+const (
+	DefaultJPEGQuality = 80 // First attempt quality
+	MinJPEGQuality     = 40 // Lowest quality to try
+	JPEGQualityStep    = 20 // Reduction per attempt
 )
 
 // SlackFileDownloader interface allows mocking the Slack file download functionality
@@ -384,8 +394,83 @@ func DownloadImagesWithConcurrencyLimit(ctx context.Context, slackClient SlackFi
 	return imageData, warnings
 }
 
+// DownloadImagesWithBudget downloads images in chronological order up to a size budget.
+// Attempts compression for images that exceed remaining budget.
+// Returns: included images map, MIME type overrides map, skipped images slice, and warning messages.
+func DownloadImagesWithBudget(ctx context.Context, slackClient SlackFileDownloader, images []ImageInfo, budget int) (map[string][]byte, map[string]string, []ImageInfo, []string) {
+	// Limit to MaxImagesPerCall
+	if len(images) > MaxImagesPerCall {
+		images = images[:MaxImagesPerCall]
+	}
+
+	if len(images) == 0 {
+		return make(map[string][]byte), make(map[string]string), nil, nil
+	}
+
+	imageData := make(map[string][]byte)
+	mimeTypeOverrides := make(map[string]string) // key -> new MIME type if compression changed it
+	var skippedImages []ImageInfo
+	var warnings []string
+	cumulativeSize := 0
+	budgetExceeded := false
+
+	// Process images in message order (newest-first, matching Slack API response)
+	for _, img := range images {
+		// Generate a unique key (use FileID if available, otherwise URL)
+		key := img.FileID
+		if key == "" {
+			key = img.URL
+		}
+
+		// If budget already exceeded, skip remaining images
+		if budgetExceeded {
+			skippedImages = append(skippedImages, img)
+			continue
+		}
+
+		// Skip images that are known to be over the individual size limit
+		if img.Size > MaxImageSize {
+			warnings = append(warnings, fmt.Sprintf("Skipped image: image '%s' size %d bytes exceeds limit", img.Name, img.Size))
+			continue
+		}
+
+		// Download the image
+		data, err := DownloadImage(ctx, slackClient, img.URL)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("Skipped image: %v", err))
+			continue
+		}
+
+		// Calculate remaining budget for this image
+		remainingBudget := budget - cumulativeSize
+
+		// Try compression if image exceeds remaining budget
+		compResult, _ := CompressImageIfNeeded(data, img.MimeType, remainingBudget)
+		data = compResult.Data
+
+		// Track MIME type change if compression occurred
+		if compResult.WasConverted {
+			mimeTypeOverrides[key] = compResult.MimeType
+		}
+
+		// Check if (possibly compressed) image fits within budget
+		if cumulativeSize+len(data) > budget {
+			budgetExceeded = true
+			skippedImages = append(skippedImages, img)
+			continue
+		}
+
+		// Image fits within budget
+		imageData[key] = data
+		cumulativeSize += len(data)
+	}
+
+	return imageData, mimeTypeOverrides, skippedImages, warnings
+}
+
 // ImagesToMCPContent converts downloaded images to MCP ImageContent
-func ImagesToMCPContent(images []ImageInfo, imageData map[string][]byte) []mcp.Content {
+// mimeTypeOverrides contains key -> new MIME type for images that were compressed
+func ImagesToMCPContent(images []ImageInfo, imageData map[string][]byte, mimeTypeOverrides map[string]string) []mcp.Content {
 	var content []mcp.Content
 
 	for _, img := range images {
@@ -401,13 +486,89 @@ func ImagesToMCPContent(images []ImageInfo, imageData map[string][]byte) []mcp.C
 			continue
 		}
 
+		// Use overridden MIME type if compression changed it, otherwise use original
+		mimeType := img.MimeType
+		if override, exists := mimeTypeOverrides[key]; exists {
+			mimeType = override
+		}
+
 		// Base64 encode the image data
 		encoded := base64.StdEncoding.EncodeToString(data)
 
 		// Create MCP ImageContent
-		imageContent := mcp.NewImageContent(encoded, img.MimeType)
+		imageContent := mcp.NewImageContent(encoded, mimeType)
 		content = append(content, imageContent)
 	}
 
 	return content
+}
+
+// CompressImageResult holds the result of image compression
+type CompressImageResult struct {
+	Data         []byte
+	MimeType     string
+	WasConverted bool
+	OriginalSize int
+	FinalSize    int
+}
+
+// compressPNGToJPEG converts PNG image data to JPEG at the specified quality (1-100)
+func compressPNGToJPEG(pngData []byte, quality int) ([]byte, error) {
+	// Decode PNG
+	img, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode PNG: %w", err)
+	}
+
+	// Encode as JPEG
+	var buf bytes.Buffer
+	err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode JPEG: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// CompressImageIfNeeded converts PNG images to JPEG for size savings.
+// Always converts PNG to JPEG (typically 40-70% smaller), with progressive
+// quality reduction (80 → 60 → 40) if needed to fit within budget.
+// Non-PNG images (JPEG/GIF/WebP) are returned unchanged.
+func CompressImageIfNeeded(data []byte, mimeType string, budget int) (*CompressImageResult, error) {
+	result := &CompressImageResult{
+		Data:         data,
+		MimeType:     mimeType,
+		WasConverted: false,
+		OriginalSize: len(data),
+		FinalSize:    len(data),
+	}
+
+	// Only compress PNG (JPEG/GIF/WebP are already compressed)
+	// Always convert PNG to JPEG for size savings, even if under budget
+	if mimeType != "image/png" {
+		return result, nil
+	}
+
+	// Try progressive quality levels: 80, 60, 40
+	// Start with quality 80 (best quality), reduce if needed to fit budget
+	qualities := []int{DefaultJPEGQuality, DefaultJPEGQuality - JPEGQualityStep, MinJPEGQuality}
+
+	for _, quality := range qualities {
+		compressed, err := compressPNGToJPEG(data, quality)
+		if err != nil {
+			continue // Try next quality level
+		}
+
+		// If under budget OR this is the last quality level, use this result
+		if len(compressed) <= budget || quality == MinJPEGQuality {
+			result.Data = compressed
+			result.MimeType = "image/jpeg"
+			result.WasConverted = true
+			result.FinalSize = len(compressed)
+			return result, nil
+		}
+	}
+
+	// Fallback: compression failed entirely, return original PNG
+	return result, nil
 }

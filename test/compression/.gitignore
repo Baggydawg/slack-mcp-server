@@ -1,0 +1,7 @@
+# Ignore test images but keep directory structure
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+!.gitkeep

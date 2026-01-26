@@ -1,6 +1,13 @@
 package handler
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"io"
 	"testing"
 
 	"github.com/slack-go/slack"
@@ -801,5 +808,309 @@ func TestUnitExtractFilenameFromURL(t *testing.T) {
 				t.Errorf("extractFilenameFromURL(%q) = %q, want %q", tt.url, got, tt.expected)
 			}
 		})
+	}
+}
+
+// mockSlackFileDownloader is a mock implementation of SlackFileDownloader for testing
+type mockSlackFileDownloader struct {
+	files map[string][]byte // URL -> data mapping
+	err   error             // error to return (if any)
+}
+
+func (m *mockSlackFileDownloader) GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error {
+	if m.err != nil {
+		return m.err
+	}
+	if data, ok := m.files[downloadURL]; ok {
+		_, err := writer.Write(data)
+		return err
+	}
+	return fmt.Errorf("file not found: %s", downloadURL)
+}
+
+func TestUnitDownloadImagesWithBudget(t *testing.T) {
+	// Create valid PNG magic bytes for testing
+	pngMagic := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+
+	// Helper to create fake PNG data of a specific size
+	makePNG := func(size int) []byte {
+		data := make([]byte, size)
+		copy(data, pngMagic)
+		return data
+	}
+
+	tests := []struct {
+		name             string
+		images           []ImageInfo
+		budget           int
+		mockFiles        map[string][]byte
+		expectedIncluded int
+		expectedSkipped  int
+		expectedWarnings int
+	}{
+		{
+			name: "all images fit within budget",
+			images: []ImageInfo{
+				{FileID: "F001", Name: "img1.png", Size: 1000, URL: "https://files.slack.com/F001"},
+				{FileID: "F002", Name: "img2.png", Size: 1000, URL: "https://files.slack.com/F002"},
+			},
+			budget: 5000,
+			mockFiles: map[string][]byte{
+				"https://files.slack.com/F001": makePNG(1000),
+				"https://files.slack.com/F002": makePNG(1000),
+			},
+			expectedIncluded: 2,
+			expectedSkipped:  0,
+			expectedWarnings: 0,
+		},
+		{
+			name: "some images fit - partial inclusion in chronological order",
+			images: []ImageInfo{
+				{FileID: "F001", Name: "img1.png", Size: 1000, URL: "https://files.slack.com/F001"},
+				{FileID: "F002", Name: "img2.png", Size: 1000, URL: "https://files.slack.com/F002"},
+				{FileID: "F003", Name: "img3.png", Size: 1000, URL: "https://files.slack.com/F003"},
+			},
+			budget: 1500, // Only enough for first image + some buffer
+			mockFiles: map[string][]byte{
+				"https://files.slack.com/F001": makePNG(1000),
+				"https://files.slack.com/F002": makePNG(1000),
+				"https://files.slack.com/F003": makePNG(1000),
+			},
+			expectedIncluded: 1, // Only first image fits
+			expectedSkipped:  2, // Remaining two skipped
+			expectedWarnings: 0,
+		},
+		{
+			name: "first image exceeds budget - all skipped",
+			images: []ImageInfo{
+				{FileID: "F001", Name: "img1.png", Size: 2000, URL: "https://files.slack.com/F001"},
+				{FileID: "F002", Name: "img2.png", Size: 500, URL: "https://files.slack.com/F002"},
+			},
+			budget: 1000,
+			mockFiles: map[string][]byte{
+				"https://files.slack.com/F001": makePNG(2000),
+				"https://files.slack.com/F002": makePNG(500),
+			},
+			expectedIncluded: 0, // First image exceeds budget based on known size
+			expectedSkipped:  2, // Both skipped (first exceeds budget, second skipped due to budget flag)
+			expectedWarnings: 0,
+		},
+		{
+			name:             "empty images list",
+			images:           []ImageInfo{},
+			budget:           5000,
+			mockFiles:        map[string][]byte{},
+			expectedIncluded: 0,
+			expectedSkipped:  0,
+			expectedWarnings: 0,
+		},
+		{
+			name: "image without FileID uses URL as key",
+			images: []ImageInfo{
+				{FileID: "", Name: "attachment.png", Size: 500, URL: "https://files.slack.com/attachment"},
+			},
+			budget: 1000,
+			mockFiles: map[string][]byte{
+				"https://files.slack.com/attachment": makePNG(500),
+			},
+			expectedIncluded: 1,
+			expectedSkipped:  0,
+			expectedWarnings: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockSlackFileDownloader{files: tt.mockFiles}
+			ctx := context.Background()
+
+			imageData, _, skipped, warnings := DownloadImagesWithBudget(ctx, mock, tt.images, tt.budget)
+
+			if len(imageData) != tt.expectedIncluded {
+				t.Errorf("expected %d included images, got %d", tt.expectedIncluded, len(imageData))
+			}
+			if len(skipped) != tt.expectedSkipped {
+				t.Errorf("expected %d skipped images, got %d", tt.expectedSkipped, len(skipped))
+			}
+			if len(warnings) != tt.expectedWarnings {
+				t.Errorf("expected %d warnings, got %d", tt.expectedWarnings, len(warnings))
+			}
+		})
+	}
+}
+
+// createTestPNG creates a synthetic PNG image for testing
+func createTestPNG(width, height int, pattern string) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	// Fill with a pattern based on the pattern parameter
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			switch pattern {
+			case "solid":
+				img.Set(x, y, color.RGBA{100, 150, 200, 255})
+			case "gradient":
+				img.Set(x, y, color.RGBA{uint8(x % 256), uint8(y % 256), 128, 255})
+			case "checkerboard":
+				if (x/10+y/10)%2 == 0 {
+					img.Set(x, y, color.RGBA{255, 255, 255, 255})
+				} else {
+					img.Set(x, y, color.RGBA{0, 0, 0, 255})
+				}
+			default:
+				img.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8((x + y) % 256), 255})
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+func TestUnitCompressPNGToJPEG(t *testing.T) {
+	tests := []struct {
+		name    string
+		pngData []byte
+		quality int
+		wantErr bool
+	}{
+		{
+			name:    "valid PNG at quality 80",
+			pngData: createTestPNG(100, 100, "gradient"),
+			quality: 80,
+			wantErr: false,
+		},
+		{
+			name:    "valid PNG at quality 40",
+			pngData: createTestPNG(100, 100, "gradient"),
+			quality: 40,
+			wantErr: false,
+		},
+		{
+			name:    "invalid PNG data",
+			pngData: []byte("not a png"),
+			quality: 80,
+			wantErr: true,
+		},
+		{
+			name:    "empty data",
+			pngData: []byte{},
+			quality: 80,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := compressPNGToJPEG(tt.pngData, tt.quality)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			// Verify result is valid JPEG (starts with FFD8FF)
+			if len(result) < 3 || result[0] != 0xFF || result[1] != 0xD8 || result[2] != 0xFF {
+				t.Error("result is not valid JPEG data")
+			}
+		})
+	}
+}
+
+func TestUnitCompressImageIfNeeded(t *testing.T) {
+	smallPNG := createTestPNG(50, 50, "solid")
+	largePNG := createTestPNG(500, 500, "gradient")
+
+	// Create a JPEG for testing (compress a PNG first)
+	jpegData, _ := compressPNGToJPEG(createTestPNG(100, 100, "solid"), 80)
+
+	tests := []struct {
+		name          string
+		data          []byte
+		mimeType      string
+		budget        int
+		wantConverted bool
+		wantMimeType  string
+	}{
+		{
+			name:          "under budget PNG still converted to JPEG",
+			data:          smallPNG,
+			mimeType:      "image/png",
+			budget:        len(smallPNG) + 1000,
+			wantConverted: true,
+			wantMimeType:  "image/jpeg",
+		},
+		{
+			name:          "over budget PNG gets compressed",
+			data:          largePNG,
+			mimeType:      "image/png",
+			budget:        len(largePNG) / 2, // Force compression
+			wantConverted: true,
+			wantMimeType:  "image/jpeg",
+		},
+		{
+			name:          "JPEG unchanged even if over budget",
+			data:          jpegData,
+			mimeType:      "image/jpeg",
+			budget:        100, // Way under budget
+			wantConverted: false,
+			wantMimeType:  "image/jpeg",
+		},
+		{
+			name:          "GIF unchanged",
+			data:          []byte("fake gif data"),
+			mimeType:      "image/gif",
+			budget:        1,
+			wantConverted: false,
+			wantMimeType:  "image/gif",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := CompressImageIfNeeded(tt.data, tt.mimeType, tt.budget)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			if result.WasConverted != tt.wantConverted {
+				t.Errorf("WasConverted = %v, want %v", result.WasConverted, tt.wantConverted)
+			}
+
+			if result.MimeType != tt.wantMimeType {
+				t.Errorf("MimeType = %v, want %v", result.MimeType, tt.wantMimeType)
+			}
+
+			if result.OriginalSize != len(tt.data) {
+				t.Errorf("OriginalSize = %d, want %d", result.OriginalSize, len(tt.data))
+			}
+		})
+	}
+}
+
+func TestUnitCompressPNGToJPEG_QualityAffectsSize(t *testing.T) {
+	png := createTestPNG(200, 200, "gradient")
+
+	jpeg80, err := compressPNGToJPEG(png, 80)
+	if err != nil {
+		t.Fatalf("compression at 80 failed: %v", err)
+	}
+
+	jpeg40, err := compressPNGToJPEG(png, 40)
+	if err != nil {
+		t.Fatalf("compression at 40 failed: %v", err)
+	}
+
+	// Lower quality should produce smaller file
+	if len(jpeg40) >= len(jpeg80) {
+		t.Errorf("quality 40 (%d bytes) should be smaller than quality 80 (%d bytes)",
+			len(jpeg40), len(jpeg80))
 	}
 }

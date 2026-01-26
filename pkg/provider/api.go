@@ -92,6 +92,9 @@ type SlackAPI interface {
 
 	// File download methods
 	GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error
+
+	// File info methods
+	GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*slack.File, []slack.Comment, *slack.Paging, error)
 }
 
 type MCPSlackClient struct {
@@ -299,6 +302,10 @@ func (c *MCPSlackClient) GetFileContext(ctx context.Context, downloadURL string,
 	// Use the slack-go client which has the httpClient with cookie jar configured
 	// The cookie jar ensures cookies are properly sent to files.slack.com
 	return c.slackClient.GetFileContext(ctx, downloadURL, writer)
+}
+
+func (c *MCPSlackClient) GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*slack.File, []slack.Comment, *slack.Paging, error) {
+	return c.slackClient.GetFileInfoContext(ctx, fileID, count, page)
 }
 
 func (c *MCPSlackClient) IsEnterprise() bool {

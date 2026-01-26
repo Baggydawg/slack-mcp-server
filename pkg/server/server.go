@@ -34,7 +34,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 	conversationsHandler := handler.NewConversationsHandler(provider, logger)
 
 	s.AddTool(mcp.NewTool("conversations_history",
-		mcp.WithDescription("Get messages from the channel (or DM) by channel_id, the last row/column in the response is used as 'cursor' parameter for pagination if not empty"),
+		mcp.WithDescription("Get messages from the channel (or DM) by channel_id. Images are included automatically but may be limited by size. If the response indicates images were skipped, you MUST call get_image for each listed file ID to retrieve them - they often contain critical context."),
 		mcp.WithTitleAnnotation("Get Conversation History"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("channel_id",
@@ -81,7 +81,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 	), conversationsHandler.ConversationsHistoryHandler)
 
 	s.AddTool(mcp.NewTool("conversations_replies",
-		mcp.WithDescription("Get a thread of messages posted to a conversation by channelID and thread_ts, the last row/column in the response is used as 'cursor' parameter for pagination if not empty"),
+		mcp.WithDescription("Get a thread of messages by channel_id and thread_ts. Images are included automatically but may be limited by size. If the response indicates images were skipped, you MUST call get_image for each listed file ID."),
 		mcp.WithTitleAnnotation("Get Thread Replies"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("channel_id",
@@ -147,10 +147,10 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 			mcp.Description("Filter messages in a direct message (DM) or multi-person direct message (MPIM) conversation by its ID or name. Example: 'D1234567890' or '@username_dm'. If not provided, all DMs and MPIMs will be searched."),
 		),
 		mcp.WithString("filter_users_with",
-			mcp.Description("Filter messages with a specific user by their ID or display name in threads and DMs. Example: 'U1234567890' or '@username'. If not provided, all threads and DMs will be searched."),
+			mcp.Description("Filter messages with a specific user. Use @username format (e.g., '@i.bastos') or user ID (e.g., 'U1234567890'). Call get_team_context first to find usernames. Do NOT use display names like 'Ian'."),
 		),
 		mcp.WithString("filter_users_from",
-			mcp.Description("Filter messages from a specific user by their ID or display name. Example: 'U1234567890' or '@username'. If not provided, all users will be searched."),
+			mcp.Description("Filter messages from a specific user. Use @username format (e.g., '@j.smith') or user ID (e.g., 'U1234567890'). Call get_team_context first to find usernames. Do NOT use display names like 'John'."),
 		),
 		mcp.WithString("filter_date_before",
 			mcp.Description("Filter messages sent before a specific date in format 'YYYY-MM-DD'. Example: '2023-10-01', 'July', 'Yesterday' or 'Today'. If not provided, all dates will be searched."),
@@ -268,6 +268,18 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		mcp.WithTitleAnnotation("Get Team Context"),
 		mcp.WithReadOnlyHintAnnotation(true),
 	), teamContextHandler.GetTeamContextHandler)
+
+	// Add get_image tool for fetching images by file ID
+	imagesHandler := handler.NewImagesHandler(provider, logger)
+	s.AddTool(mcp.NewTool("get_image",
+		mcp.WithDescription("Fetch a single image by its Slack file ID. Use this to retrieve images that were not included inline due to size limits. The file ID can be found in the imageRefs column of conversation history."),
+		mcp.WithTitleAnnotation("Get Image"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("file_id",
+			mcp.Required(),
+			mcp.Description("The Slack file ID (e.g., F0AAJ80JHL7) from the imageRefs column in conversation history."),
+		),
+	), imagesHandler.GetImageHandler)
 
 	return &MCPServer{
 		server: s,
