@@ -53,6 +53,7 @@ type Message struct {
 	IsThreadReply    bool   `json:"isThreadReply,omitempty"`
 	ThreadReplyCount int    `json:"threadReplyCount,omitempty"`
 	ThreadTruncated  bool   `json:"threadTruncated,omitempty"`
+	ImageCount       int    `json:"imageCount,omitempty"`
 }
 
 type User struct {
@@ -616,6 +617,9 @@ func (ch *ConversationsHandler) convertSingleMessage(msg slack.Message, channel 
 	}
 	reactionsString := strings.Join(reactionParts, "|")
 
+	// Count images in this message
+	imageCount := len(ExtractImagesFromMessage(msg)) + len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+
 	return &Message{
 		MsgID:            msg.Timestamp,
 		UserID:           msg.User,
@@ -627,6 +631,7 @@ func (ch *ConversationsHandler) convertSingleMessage(msg slack.Message, channel 
 		Time:             timestamp,
 		Reactions:        reactionsString,
 		ThreadReplyCount: msg.ReplyCount,
+		ImageCount:       imageCount,
 	}
 }
 
@@ -674,6 +679,9 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 		}
 		reactionsString := strings.Join(reactionParts, "|")
 
+		// Count images in this message
+		imageCount := len(ExtractImagesFromMessage(msg)) + len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+
 		messages = append(messages, Message{
 			MsgID:            msg.Timestamp,
 			UserID:           msg.User,
@@ -685,6 +693,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 			Time:             timestamp,
 			Reactions:        reactionsString,
 			ThreadReplyCount: msg.ReplyCount,
+			ImageCount:       imageCount,
 		})
 	}
 
@@ -735,16 +744,20 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 
 		msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
 
+		// Count images from attachments (SearchMessage may not include Files)
+		imageCount := len(ExtractImagesFromAttachments(msg.Attachments, msg.Timestamp))
+
 		messages = append(messages, Message{
-			MsgID:     msg.Timestamp,
-			UserID:    msg.User,
-			UserName:  userName,
-			RealName:  realName,
-			Text:      text.ProcessText(msgText),
-			Channel:   fmt.Sprintf("#%s", msg.Channel.Name),
-			ThreadTs:  threadTs,
-			Time:      timestamp,
-			Reactions: "",
+			MsgID:      msg.Timestamp,
+			UserID:     msg.User,
+			UserName:   userName,
+			RealName:   realName,
+			Text:       text.ProcessText(msgText),
+			Channel:    fmt.Sprintf("#%s", msg.Channel.Name),
+			ThreadTs:   threadTs,
+			Time:       timestamp,
+			Reactions:  "",
+			ImageCount: imageCount,
 		})
 	}
 
@@ -775,7 +788,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	includeThreads := request.GetBool("include_threads", false)
 	maxThreads := request.GetInt("max_threads", 5)
 	maxRepliesPerThread := request.GetInt("max_replies_per_thread", 25)
-	includeImages := request.GetBool("include_images", false)
+	includeImages := request.GetBool("include_images", true)
 
 	// Cap maxThreads at 20
 	if maxThreads > 20 {

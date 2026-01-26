@@ -75,8 +75,8 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 			mcp.DefaultNumber(25),
 		),
 		mcp.WithBoolean("include_images",
-			mcp.Description("Include images from messages in the response (default: false)"),
-			mcp.DefaultBool(false),
+			mcp.Description("Include images from messages in the response (default: true). Set to false to skip image downloads for faster responses."),
+			mcp.DefaultBool(true),
 		),
 	), conversationsHandler.ConversationsHistoryHandler)
 
@@ -108,8 +108,8 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 			mcp.Description("Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided."),
 		),
 		mcp.WithBoolean("include_images",
-			mcp.Description("Include images from messages in the response (default: false)"),
-			mcp.DefaultBool(false),
+			mcp.Description("Include images from messages in the response (default: true). Set to false to skip image downloads for faster responses."),
+			mcp.DefaultBool(true),
 		),
 	), conversationsHandler.ConversationsRepliesHandler)
 

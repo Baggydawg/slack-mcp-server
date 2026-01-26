@@ -96,6 +96,16 @@ func (tch *TeamContextHandler) resolveUserInput(input string, usersMap *provider
 	return input, input, false
 }
 
+// parseAliasEntry parses an entry that may contain an alias in format "alias=value" or just "value"
+// Returns (alias, value) where alias may be empty if no alias was specified
+func parseAliasEntry(entry string) (alias, value string) {
+	entry = strings.TrimSpace(entry)
+	if idx := strings.Index(entry, "="); idx != -1 {
+		return strings.TrimSpace(entry[:idx]), strings.TrimSpace(entry[idx+1:])
+	}
+	return "", entry
+}
+
 // GetTeamContextHandler returns contextual information about priority channels and team members
 func (tch *TeamContextHandler) GetTeamContextHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	tch.logger.Debug("GetTeamContextHandler called", zap.Any("params", request.Params))
@@ -123,27 +133,33 @@ func (tch *TeamContextHandler) GetTeamContextHandler(ctx context.Context, reques
 
 	if priorityChannels != "" {
 		contextParts = append(contextParts, "## Priority Channels")
-		contextParts = append(contextParts, "These are the main channels that the team uses. Focus on these channels when summarizing activity or searching for information:\n")
+		contextParts = append(contextParts, "These are the main channels to focus on. Use the channel_id shown when calling Slack tools:\n")
 
-		channelIDs := strings.Split(priorityChannels, ",")
+		channelEntries := strings.Split(priorityChannels, ",")
 		channelsMap := tch.apiProvider.ProvideChannelsMaps()
 		if channelsMap == nil || channelsMap.Channels == nil {
 			return mcp.NewToolResultError("Channel cache not initialized"), nil
 		}
 
-		for _, entry := range channelIDs {
+		for _, entry := range channelEntries {
 			entry = strings.TrimSpace(entry)
 			if entry == "" {
 				continue // Skip empty entries
 			}
-			id, name, found := tch.resolveChannelInput(entry, channelsMap)
+			alias, channelRef := parseAliasEntry(entry)
+			id, name, found := tch.resolveChannelInput(channelRef, channelsMap)
 			if found {
 				if ch, ok := channelsMap.Channels[id]; ok {
 					purpose := ch.Purpose
 					if purpose == "" {
 						purpose = "(no purpose set)"
 					}
-					contextParts = append(contextParts, fmt.Sprintf("- #%s (%s): %s", name, id, purpose))
+					if alias != "" {
+						// Include alias mapping for Claude to understand
+						contextParts = append(contextParts, fmt.Sprintf("- **%s** → #%s (channel_id: %s): %s", alias, name, id, purpose))
+					} else {
+						contextParts = append(contextParts, fmt.Sprintf("- #%s (channel_id: %s): %s", name, id, purpose))
+					}
 				}
 			} else {
 				contextParts = append(contextParts, fmt.Sprintf("- %s (WARNING: not found in workspace)", entry))
@@ -154,23 +170,47 @@ func (tch *TeamContextHandler) GetTeamContextHandler(ctx context.Context, reques
 
 	if priorityUsers != "" {
 		contextParts = append(contextParts, "## Team Members")
-		contextParts = append(contextParts, "These are the key team members. Prioritize messages from these users:\n")
+		contextParts = append(contextParts, "These are the key team members. Use the @username or DM channel_id when calling Slack tools:\n")
 
-		userIDs := strings.Split(priorityUsers, ",")
+		userEntries := strings.Split(priorityUsers, ",")
 		usersMap := tch.apiProvider.ProvideUsersMap()
+		channelsMap := tch.apiProvider.ProvideChannelsMaps()
 		if usersMap == nil || usersMap.Users == nil {
 			return mcp.NewToolResultError("User cache not initialized"), nil
 		}
 
-		for _, entry := range userIDs {
+		for _, entry := range userEntries {
 			entry = strings.TrimSpace(entry)
 			if entry == "" {
 				continue // Skip empty entries
 			}
-			id, displayName, found := tch.resolveUserInput(entry, usersMap)
+			alias, userRef := parseAliasEntry(entry)
+			id, displayName, found := tch.resolveUserInput(userRef, usersMap)
 			if found {
 				if u, ok := usersMap.Users[id]; ok {
-					contextParts = append(contextParts, fmt.Sprintf("- %s (@%s, %s)", displayName, u.Name, id))
+					// Try to find DM channel for this user
+					dmChannelID := ""
+					dmKey := "@" + u.Name
+					if channelsMap != nil && channelsMap.ChannelsInv != nil {
+						if dmID, ok := channelsMap.ChannelsInv[dmKey]; ok {
+							dmChannelID = dmID
+						}
+					}
+
+					if alias != "" {
+						// Include alias mapping for Claude to understand
+						if dmChannelID != "" {
+							contextParts = append(contextParts, fmt.Sprintf("- **%s** → %s (@%s, user_id: %s, dm_channel: %s)", alias, displayName, u.Name, id, dmChannelID))
+						} else {
+							contextParts = append(contextParts, fmt.Sprintf("- **%s** → %s (@%s, user_id: %s)", alias, displayName, u.Name, id))
+						}
+					} else {
+						if dmChannelID != "" {
+							contextParts = append(contextParts, fmt.Sprintf("- %s (@%s, user_id: %s, dm_channel: %s)", displayName, u.Name, id, dmChannelID))
+						} else {
+							contextParts = append(contextParts, fmt.Sprintf("- %s (@%s, user_id: %s)", displayName, u.Name, id))
+						}
+					}
 				}
 			} else {
 				contextParts = append(contextParts, fmt.Sprintf("- %s (WARNING: not found in workspace)", entry))
@@ -181,9 +221,10 @@ func (tch *TeamContextHandler) GetTeamContextHandler(ctx context.Context, reques
 
 	if priorityChannels != "" || priorityUsers != "" {
 		contextParts = append(contextParts, "## Usage Guidelines")
-		contextParts = append(contextParts, "- When asked to summarize Slack activity, focus on these priority channels and users")
+		contextParts = append(contextParts, "- **IMPORTANT**: When the user mentions a person or channel by nickname/alias (shown in bold above), use the corresponding @username or channel_id in tool calls")
+		contextParts = append(contextParts, "- For DMs with team members, use their dm_channel ID as channel_id in conversations_history")
+		contextParts = append(contextParts, "- For user filters in search, use @username format (e.g., filter_users_from: '@i.bastos')")
 		contextParts = append(contextParts, "- Bot messages are filtered by default. Use exclude_bots=false to include them.")
-		contextParts = append(contextParts, "- Other channels in the workspace may contain automated notifications that are less relevant")
 	} else {
 		contextParts = append(contextParts, "No priority channels or team members configured. Set SLACK_MCP_PRIORITY_CHANNELS and SLACK_MCP_PRIORITY_USERS environment variables to provide context.")
 	}
