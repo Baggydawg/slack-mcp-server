@@ -134,7 +134,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 	), conversationsHandler.ConversationsAddMessageHandler)
 
 	conversationsSearchTool := mcp.NewTool("conversations_search_messages",
-		mcp.WithDescription("Search messages in a public channel, private channel, or direct message (DM, or IM) conversation using filters. All filters are optional, if not provided then search_query is required."),
+		mcp.WithDescription("Search messages in a public channel, private channel, or direct message (DM, or IM) conversation using filters. All filters are optional, if not provided then search_query is required. IMPORTANT: Workspace conversations may be in Spanish as well as English. When searching for concepts or keywords, try multiple queries using both English terms AND equivalent Spanish terms. For example, if searching for 'funnel status' also try 'estado del embudo' or 'estado funnel'. This significantly improves recall for multilingual workspaces."),
 		mcp.WithTitleAnnotation("Search Messages"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("search_query",
